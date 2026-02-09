@@ -3,7 +3,6 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 import time
-import random
 
 # --- SAFETY SHIELD: Check for Matplotlib ---
 try:
@@ -12,9 +11,9 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-st.set_page_config(page_title="Pro PCR Intel", layout="wide")
+st.set_page_config(page_title="Live NSE PCR Tracker", layout="wide")
 
-class NSEPro:
+class NSELive:
     def __init__(self):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -23,73 +22,85 @@ class NSEPro:
         }
         self.session = requests.Session()
 
-    def get_mock_data(self, symbol):
-        prices = {"NIFTY": 25600, "BANKNIFTY": 52400, "FINNIFTY": 23800, "MIDCPNIFTY": 13200, "NIFTYNXT50": 78000}
-        intervals = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25, "NIFTYNXT50": 100}
-        spot = prices.get(symbol, 20000)
-        interval = intervals.get(symbol, 50)
-        strikes = [spot + (i * interval) for i in range(-5, 6)]
-        df = pd.DataFrame({
-            'Strike': strikes,
-            'Call OI': [random.randint(5000, 25000) for _ in strikes],
-            'Put OI': [random.randint(5000, 25000) for _ in strikes],
-            'Call OI Chg': [random.randint(-500, 1000) for _ in strikes],
-            'Put OI Chg': [random.randint(-500, 1000) for _ in strikes]
-        })
-        pcr = round(df['Put OI'].sum() / df['Call OI'].sum(), 2)
-        return {"spot": spot, "atm_pcr": pcr, "pe_total": df['Put OI'].sum(), "ce_total": df['Call OI'].sum(), "table": df}, None
-
-    def get_live_data(self, symbol):
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    def get_data(self, symbol):
+        # Initial request to establish cookies/session
+        base_url = "https://www.nseindia.com"
+        api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        
         try:
-            self.session.get("https://www.nseindia.com", headers=self.headers, timeout=5)
-            response = self.session.get(url, headers=self.headers, timeout=10)
+            self.session.get(base_url, headers=self.headers, timeout=5)
+            response = self.session.get(api_url, headers=self.headers, timeout=10)
+            
+            if response.status_code != 200:
+                return None, f"NSE Server Error: {response.status_code}"
+                
             data = response.json()
+            
             if 'filtered' not in data or not data['filtered']['data']:
-                return None, "Market Closed"
+                return None, "No data found (Market likely closed or API restricted)"
+
             underlying = data['records']['underlyingValue']
             df_raw = pd.json_normalize(data['filtered']['data'])
+            
+            # Calculate distance from spot to find ATM
             df_raw['diff'] = abs(df_raw['strikePrice'] - underlying)
             atm_idx = df_raw['diff'].idxmin()
+            
+            # Get 5 strikes above and 5 below ATM (11 strikes total)
             subset = df_raw.iloc[max(0, atm_idx-5):atm_idx+6].copy()
-            pcr = round(subset['PE.openInterest'].sum() / subset['CE.openInterest'].sum(), 2)
+            
+            # Calculate PCR
+            pe_oi_sum = subset['PE.openInterest'].sum()
+            ce_oi_sum = subset['CE.openInterest'].sum()
+            pcr = round(pe_oi_sum / ce_oi_sum, 2) if ce_oi_sum != 0 else 0
+            
             display_df = subset[['strikePrice', 'CE.openInterest', 'PE.openInterest', 'CE.changeinOpenInterest', 'PE.changeinOpenInterest']]
             display_df.columns = ['Strike', 'Call OI', 'Put OI', 'Call OI Chg', 'Put OI Chg']
-            return {"spot": underlying, "atm_pcr": pcr, "pe_total": subset['PE.openInterest'].sum(), "ce_total": subset['CE.openInterest'].sum(), "table": display_df}, None
+            
+            return {
+                "spot": underlying, 
+                "atm_pcr": pcr, 
+                "pe_total": pe_oi_sum, 
+                "ce_total": ce_oi_sum, 
+                "table": display_df
+            }, None
+            
         except Exception as e:
-            return None, str(e)
+            return None, f"Connection Error: {str(e)}"
 
 # --- ANALYZER LOGIC ---
 def get_suggestion(pcr, history):
     if len(history) < 2:
-        return "Analyzing Momentum...", "gray"
+        return "Establishing Trend...", "gray"
     
     prev_pcr = history.iloc[-2]['PCR']
     trend = "Rising" if pcr > prev_pcr else "Falling"
     
     if pcr > 1.3:
-        return f"OVERBOUGHT ({trend} PCR). Look for reversal or trail SL.", "red"
+        return f"OVERBOUGHT ({trend} PCR). Caution on longs.", "red"
     elif pcr > 1.1 and trend == "Rising":
-        return "STRONG BULLISH. Dip buying preferred.", "green"
+        return "BULLISH MOMENTUM. Support is strengthening.", "green"
     elif pcr < 0.7 and trend == "Falling":
-        return "STRONG BEARISH. Sell on rise preferred.", "red"
+        return "BEARISH MOMENTUM. Resistance is building.", "red"
     elif pcr < 0.6:
-        return "OVERSOLD. Potential bounce back zone.", "green"
+        return "OVERSOLD. Potential for short covering bounce.", "green"
     elif 0.9 <= pcr <= 1.1:
-        return "NEUTRAL. Market in consolidation.", "blue"
+        return "NEUTRAL / SIDEWAYS. Wait for breakout.", "blue"
     else:
-        return f"MOMENTUM: {trend}. Wait for clarity.", "orange"
+        return f"PCR: {pcr} | Trend: {trend}", "orange"
 
 # --- APP SETUP ---
-nse = NSEPro()
+nse = NSELive()
+
 with st.sidebar:
-    st.header("⚙️ Controls")
-    sim_mode = st.toggle("Simulation Mode", value=True)
-    selected_index = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
-    refresh_speed = st.slider("Refresh (Sec)", 5, 300, 10 if sim_mode else 60)
+    st.header("📈 Market Controls")
+    selected_index = st.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+    refresh_speed = st.slider("Refresh Interval (Seconds)", 30, 300, 60)
+    st.info("Note: NSE API may block frequent requests. Default is 60s.")
 
-st.title("🚀 Smart PCR Intel & Suggestion Engine")
+st.title(f"📊 Live {selected_index} PCR Analyzer")
 
+# Initialize session state for history
 if 'history' not in st.session_state:
     st.session_state.history = {idx: pd.DataFrame(columns=['Time', 'PCR']) for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]}
 
@@ -97,47 +108,66 @@ placeholder = st.empty()
 
 while True:
     with placeholder.container():
-        res, err = nse.get_mock_data(selected_index) if sim_mode else nse.get_live_data(selected_index)
-        if not res:
-            res, _ = nse.get_mock_data(selected_index)
-            status_text = "🟠 SIMULATED (Market Closed)"
+        res, err = nse.get_data(selected_index)
+        
+        if err:
+            st.error(f"⚠️ {err}")
+            st.button("Retry Now")
+            time.sleep(10)
+            st.rerun()
         else:
-            status_text = "🟢 LIVE DATA"
-
-        curr_time = time.strftime("%H:%M:%S")
-        new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [res['atm_pcr']]})
-        st.session_state.history[selected_index] = pd.concat([st.session_state.history[selected_index], new_entry], ignore_index=True).tail(50)
-
-        # --- AI SUGGESTION BOX ---
-        suggestion, color = get_suggestion(res['atm_pcr'], st.session_state.history[selected_index])
-        st.info(f"**AI ANALYZER:** {suggestion}")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Spot Price", f"₹{res['spot']}")
-        c2.metric("PCR", res['atm_pcr'], delta=round(res['atm_pcr']-1.0, 2))
-        c3.metric("Put OI", f"{res['pe_total']:,}")
-        c4.metric("Call OI", f"{res['ce_total']:,}")
-
-        # Charts Section
-        st.divider()
-        col_chart, col_bars = st.columns([2, 1])
-        with col_chart:
-            st.subheader("PCR Momentum History")
-            fig = go.Figure(go.Scatter(x=st.session_state.history[selected_index]['Time'], 
-                                     y=st.session_state.history[selected_index]['PCR'],
-                                     mode='lines+markers', line=dict(color='#2ecc71', width=3)))
-            fig.update_layout(template="plotly_dark", height=300)
-            st.plotly_chart(fig, use_container_width=True)
+            curr_time = time.strftime("%H:%M:%S")
             
-        with col_bars:
-            st.subheader("Support vs Resistance")
-            st.bar_chart(data=pd.DataFrame({'OI': [res['pe_total'], res['ce_total']]}, index=['Puts', 'Calls']))
+            # Update history
+            new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [res['atm_pcr']]})
+            st.session_state.history[selected_index] = pd.concat(
+                [st.session_state.history[selected_index], new_entry], 
+                ignore_index=True
+            ).tail(50)
 
-        st.subheader("Live Option Chain (ATM)")
-        if HAS_MATPLOTLIB:
-            st.dataframe(res['table'].style.background_gradient(subset=['Put OI Chg', 'Call OI Chg'], cmap='RdYlGn'), use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(res['table'], use_container_width=True, hide_index=True)
+            # AI Suggestion Box
+            suggestion, color = get_suggestion(res['atm_pcr'], st.session_state.history[selected_index])
+            st.info(f"**Market Sentiment:** {suggestion}")
+
+            # Top Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Spot Price", f"₹{res['spot']:,}")
+            c2.metric("ATM PCR", res['atm_pcr'], delta=round(res['atm_pcr']-1.0, 2))
+            c3.metric("Total Put OI", f"{res['pe_total']:,}")
+            c4.metric("Total Call OI", f"{res['ce_total']:,}")
+
+            st.divider()
+
+            # Visualizations
+            col_chart, col_bars = st.columns([2, 1])
+            with col_chart:
+                st.subheader("Intraday PCR Trend")
+                fig = go.Figure(go.Scatter(
+                    x=st.session_state.history[selected_index]['Time'], 
+                    y=st.session_state.history[selected_index]['PCR'],
+                    mode='lines+markers', 
+                    line=dict(color='#00d1b2', width=3)
+                ))
+                fig.update_layout(template="plotly_dark", height=300, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col_bars:
+                st.subheader("OI Pulse")
+                st.bar_chart(data=pd.DataFrame(
+                    {'OI': [res['pe_total'], res['ce_total']]}, 
+                    index=['Puts (Support)', 'Calls (Resist)']
+                ))
+
+            # Live Data Table
+            st.subheader("ATM Option Chain (Live)")
+            if HAS_MATPLOTLIB:
+                st.dataframe(
+                    res['table'].style.background_gradient(subset=['Put OI Chg', 'Call OI Chg'], cmap='RdYlGn'), 
+                    use_container_width=True, 
+                    hide_index=True
+                )
+            else:
+                st.dataframe(res['table'], use_container_width=True, hide_index=True)
 
     time.sleep(refresh_speed)
     st.rerun()
