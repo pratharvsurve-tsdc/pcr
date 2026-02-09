@@ -3,16 +3,40 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 import time
+from datetime import datetime
+import pytz
 
-# --- SAFETY SHIELD: Check for Matplotlib ---
-try:
-    import matplotlib
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
+st.set_page_config(page_title="NSE Live PCR Intel", layout="wide")
 
-st.set_page_config(page_title="Live NSE PCR Tracker", layout="wide")
+# --- 1. MARKET STATUS CHECKER ---
+def is_market_open():
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    
+    # Check for Weekends
+    if now.weekday() >= 5:  # 5 is Saturday, 6 is Sunday
+        return False, "Market is Closed (Weekend)"
 
+    # Check for 2026 NSE Holidays
+    holidays_2026 = [
+        "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
+        "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28",
+        "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20",
+        "2026-11-10", "2026-11-24", "2026-12-25"
+    ]
+    if now.strftime("%Y-%m-%d") in holidays_2026:
+        return False, "Market is Closed (NSE Holiday)"
+
+    # Check for Timing (9:15 AM to 3:30 PM)
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    if not (market_start <= now <= market_end):
+        return False, "Market is Closed (Out of Trading Hours)"
+    
+    return True, "🟢 Market is Live"
+
+# --- 2. DATA FETCHER ---
 class NSELive:
     def __init__(self):
         self.headers = {
@@ -23,151 +47,74 @@ class NSELive:
         self.session = requests.Session()
 
     def get_data(self, symbol):
-        # Initial request to establish cookies/session
         base_url = "https://www.nseindia.com"
         api_url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        
         try:
             self.session.get(base_url, headers=self.headers, timeout=5)
             response = self.session.get(api_url, headers=self.headers, timeout=10)
-            
-            if response.status_code != 200:
-                return None, f"NSE Server Error: {response.status_code}"
-                
             data = response.json()
             
-            if 'filtered' not in data or not data['filtered']['data']:
-                return None, "No data found (Market likely closed or API restricted)"
-
             underlying = data['records']['underlyingValue']
             df_raw = pd.json_normalize(data['filtered']['data'])
-            
-            # Calculate distance from spot to find ATM
             df_raw['diff'] = abs(df_raw['strikePrice'] - underlying)
             atm_idx = df_raw['diff'].idxmin()
-            
-            # Get 5 strikes above and 5 below ATM (11 strikes total)
             subset = df_raw.iloc[max(0, atm_idx-5):atm_idx+6].copy()
             
-            # Calculate PCR
-            pe_oi_sum = subset['PE.openInterest'].sum()
-            ce_oi_sum = subset['CE.openInterest'].sum()
-            pcr = round(pe_oi_sum / ce_oi_sum, 2) if ce_oi_sum != 0 else 0
+            pe_oi = subset['PE.openInterest'].sum()
+            ce_oi = subset['CE.openInterest'].sum()
+            pcr = round(pe_oi / ce_oi, 2) if ce_oi != 0 else 0
             
-            display_df = subset[['strikePrice', 'CE.openInterest', 'PE.openInterest', 'CE.changeinOpenInterest', 'PE.changeinOpenInterest']]
-            display_df.columns = ['Strike', 'Call OI', 'Put OI', 'Call OI Chg', 'Put OI Chg']
+            table = subset[['strikePrice', 'CE.openInterest', 'PE.openInterest', 'CE.changeinOpenInterest', 'PE.changeinOpenInterest']]
+            table.columns = ['Strike', 'Call OI', 'Put OI', 'Call OI Chg', 'Put OI Chg']
             
-            return {
-                "spot": underlying, 
-                "atm_pcr": pcr, 
-                "pe_total": pe_oi_sum, 
-                "ce_total": ce_oi_sum, 
-                "table": display_df
-            }, None
-            
+            return {"spot": underlying, "pcr": pcr, "pe": pe_oi, "ce": ce_oi, "table": table}, None
         except Exception as e:
-            return None, f"Connection Error: {str(e)}"
+            return None, str(e)
 
-# --- ANALYZER LOGIC ---
-def get_suggestion(pcr, history):
-    if len(history) < 2:
-        return "Establishing Trend...", "gray"
+# --- 3. MAIN APP INTERFACE ---
+is_open, status_msg = is_market_open()
+
+if not is_open:
+    st.error(f"### 🛑 {status_msg}")
+    st.image("https://img.icons8.com/color/96/closed-sign.png") # Visual indicator
+    st.info("The dashboard will automatically activate once the market opens at 09:15 AM IST.")
+    if st.button("Refresh Status"):
+        st.rerun()
+else:
+    # App logic runs only if market is open
+    st.title("🚀 Smart PCR Intel")
+    selected_index = st.sidebar.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     
-    prev_pcr = history.iloc[-2]['PCR']
-    trend = "Rising" if pcr > prev_pcr else "Falling"
-    
-    if pcr > 1.3:
-        return f"OVERBOUGHT ({trend} PCR). Caution on longs.", "red"
-    elif pcr > 1.1 and trend == "Rising":
-        return "BULLISH MOMENTUM. Support is strengthening.", "green"
-    elif pcr < 0.7 and trend == "Falling":
-        return "BEARISH MOMENTUM. Resistance is building.", "red"
-    elif pcr < 0.6:
-        return "OVERSOLD. Potential for short covering bounce.", "green"
-    elif 0.9 <= pcr <= 1.1:
-        return "NEUTRAL / SIDEWAYS. Wait for breakout.", "blue"
-    else:
-        return f"PCR: {pcr} | Trend: {trend}", "orange"
+    if 'history' not in st.session_state:
+        st.session_state.history = pd.DataFrame(columns=['Time', 'PCR'])
 
-# --- APP SETUP ---
-nse = NSELive()
+    placeholder = st.empty()
+    nse = NSELive()
 
-with st.sidebar:
-    st.header("📈 Market Controls")
-    selected_index = st.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
-    refresh_speed = st.slider("Refresh Interval (Seconds)", 30, 300, 60)
-    st.info("Note: NSE API may block frequent requests. Default is 60s.")
-
-st.title(f"📊 Live {selected_index} PCR Analyzer")
-
-# Initialize session state for history
-if 'history' not in st.session_state:
-    st.session_state.history = {idx: pd.DataFrame(columns=['Time', 'PCR']) for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]}
-
-placeholder = st.empty()
-
-while True:
-    with placeholder.container():
-        res, err = nse.get_data(selected_index)
-        
-        if err:
-            st.error(f"⚠️ {err}")
-            st.button("Retry Now")
-            time.sleep(10)
-            st.rerun()
-        else:
-            curr_time = time.strftime("%H:%M:%S")
-            
-            # Update history
-            new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [res['atm_pcr']]})
-            st.session_state.history[selected_index] = pd.concat(
-                [st.session_state.history[selected_index], new_entry], 
-                ignore_index=True
-            ).tail(50)
-
-            # AI Suggestion Box
-            suggestion, color = get_suggestion(res['atm_pcr'], st.session_state.history[selected_index])
-            st.info(f"**Market Sentiment:** {suggestion}")
-
-            # Top Metrics
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Spot Price", f"₹{res['spot']:,}")
-            c2.metric("ATM PCR", res['atm_pcr'], delta=round(res['atm_pcr']-1.0, 2))
-            c3.metric("Total Put OI", f"{res['pe_total']:,}")
-            c4.metric("Total Call OI", f"{res['ce_total']:,}")
-
-            st.divider()
-
-            # Visualizations
-            col_chart, col_bars = st.columns([2, 1])
-            with col_chart:
-                st.subheader("Intraday PCR Trend")
-                fig = go.Figure(go.Scatter(
-                    x=st.session_state.history[selected_index]['Time'], 
-                    y=st.session_state.history[selected_index]['PCR'],
-                    mode='lines+markers', 
-                    line=dict(color='#00d1b2', width=3)
-                ))
-                fig.update_layout(template="plotly_dark", height=300, margin=dict(l=10, r=10, t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-                
-            with col_bars:
-                st.subheader("OI Pulse")
-                st.bar_chart(data=pd.DataFrame(
-                    {'OI': [res['pe_total'], res['ce_total']]}, 
-                    index=['Puts (Support)', 'Calls (Resist)']
-                ))
-
-            # Live Data Table
-            st.subheader("ATM Option Chain (Live)")
-            if HAS_MATPLOTLIB:
-                st.dataframe(
-                    res['table'].style.background_gradient(subset=['Put OI Chg', 'Call OI Chg'], cmap='RdYlGn'), 
-                    use_container_width=True, 
-                    hide_index=True
-                )
+    while True:
+        with placeholder.container():
+            res, err = nse.get_data(selected_index)
+            if err:
+                st.warning(f"Waiting for data... ({err})")
             else:
-                st.dataframe(res['table'], use_container_width=True, hide_index=True)
+                # Top Metrics
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Spot", f"₹{res['spot']}")
+                c2.metric("PCR", res['pcr'])
+                c3.metric("Put OI", f"{res['pe']:,}")
+                c4.metric("Call OI", f"{res['ce']:,}")
 
-    time.sleep(refresh_speed)
-    st.rerun()
+                # PCR Chart
+                st.subheader("Intraday Trend")
+                new_row = pd.DataFrame({'Time': [datetime.now().strftime("%H:%M")], 'PCR': [res['pcr']]})
+                st.session_state.history = pd.concat([st.session_state.history, new_row]).tail(50)
+                st.line_chart(st.session_state.history.set_index('Time'))
+
+                # Option Chain
+                st.subheader("ATM Option Chain")
+                st.dataframe(res['table'], hide_index=True, use_container_width=True)
+
+        time.sleep(60)
+        # Final re-check of market status before rerunning loop
+        is_open, _ = is_market_open()
+        if not is_open: st.rerun()
