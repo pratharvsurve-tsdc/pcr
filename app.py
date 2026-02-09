@@ -4,26 +4,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import time
 import random
-import base64
 
-# --- SAFETY SHIELD: Matplotlib ---
+# --- SAFETY SHIELD: Check for Matplotlib ---
 try:
     import matplotlib
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
 
-st.set_page_config(page_title="Pro PCR Intel + Alerts", layout="wide")
-
-# --- AUDIO ALERT FUNCTION ---
-def play_sound():
-    # Simple beep sound using base64 encoded audio
-    audio_html = """
-    <audio autoplay>
-      <source src="https://www.soundjay.com/buttons/beep-01a.mp3" type="audio/mpeg">
-    </audio>
-    """
-    st.components.v1.html(audio_html, height=0)
+st.set_page_config(page_title="Pro PCR Intel", layout="wide")
 
 class NSEPro:
     def __init__(self):
@@ -35,9 +24,10 @@ class NSEPro:
         self.session = requests.Session()
 
     def get_mock_data(self, symbol):
-        prices = {"NIFTY": 23500, "BANKNIFTY": 51200, "FINNIFTY": 23200, "MIDCPNIFTY": 12800}
+        prices = {"NIFTY": 25600, "BANKNIFTY": 52400, "FINNIFTY": 23800, "MIDCPNIFTY": 13200, "NIFTYNXT50": 78000}
+        intervals = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25, "NIFTYNXT50": 100}
         spot = prices.get(symbol, 20000)
-        interval = 50 if symbol != "BANKNIFTY" else 100
+        interval = intervals.get(symbol, 50)
         strikes = [spot + (i * interval) for i in range(-5, 6)]
         df = pd.DataFrame({
             'Strike': strikes,
@@ -55,7 +45,8 @@ class NSEPro:
             self.session.get("https://www.nseindia.com", headers=self.headers, timeout=5)
             response = self.session.get(url, headers=self.headers, timeout=10)
             data = response.json()
-            if 'filtered' not in data: return None, "Market Closed"
+            if 'filtered' not in data or not data['filtered']['data']:
+                return None, "Market Closed"
             underlying = data['records']['underlyingValue']
             df_raw = pd.json_normalize(data['filtered']['data'])
             df_raw['diff'] = abs(df_raw['strikePrice'] - underlying)
@@ -68,21 +59,39 @@ class NSEPro:
         except Exception as e:
             return None, str(e)
 
+# --- ANALYZER LOGIC ---
+def get_suggestion(pcr, history):
+    if len(history) < 2:
+        return "Analyzing Momentum...", "gray"
+    
+    prev_pcr = history.iloc[-2]['PCR']
+    trend = "Rising" if pcr > prev_pcr else "Falling"
+    
+    if pcr > 1.3:
+        return f"OVERBOUGHT ({trend} PCR). Look for reversal or trail SL.", "red"
+    elif pcr > 1.1 and trend == "Rising":
+        return "STRONG BULLISH. Dip buying preferred.", "green"
+    elif pcr < 0.7 and trend == "Falling":
+        return "STRONG BEARISH. Sell on rise preferred.", "red"
+    elif pcr < 0.6:
+        return "OVERSOLD. Potential bounce back zone.", "green"
+    elif 0.9 <= pcr <= 1.1:
+        return "NEUTRAL. Market in consolidation.", "blue"
+    else:
+        return f"MOMENTUM: {trend}. Wait for clarity.", "orange"
+
 # --- APP SETUP ---
 nse = NSEPro()
 with st.sidebar:
     st.header("⚙️ Controls")
     sim_mode = st.toggle("Simulation Mode", value=True)
-    enable_audio = st.toggle("Enable Audio Alerts", value=True)
     selected_index = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     refresh_speed = st.slider("Refresh (Sec)", 5, 300, 10 if sim_mode else 60)
 
-st.title("🛡️ Pro Option Intel: Signal Desk")
+st.title("🚀 Smart PCR Intel & Suggestion Engine")
 
 if 'history' not in st.session_state:
     st.session_state.history = {idx: pd.DataFrame(columns=['Time', 'PCR']) for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]}
-if 'last_signal' not in st.session_state:
-    st.session_state.last_signal = None
 
 placeholder = st.empty()
 
@@ -91,51 +100,40 @@ while True:
         res, err = nse.get_mock_data(selected_index) if sim_mode else nse.get_live_data(selected_index)
         if not res:
             res, _ = nse.get_mock_data(selected_index)
-            st.caption("Using Offline Simulation Data")
+            status_text = "🟠 SIMULATED (Market Closed)"
+        else:
+            status_text = "🟢 LIVE DATA"
 
         curr_time = time.strftime("%H:%M:%S")
-        pcr = res['atm_pcr']
-        new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [pcr]})
+        new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [res['atm_pcr']]})
         st.session_state.history[selected_index] = pd.concat([st.session_state.history[selected_index], new_entry], ignore_index=True).tail(50)
 
-        # --- SIGNAL ANALYZER ---
-        signal = "NEUTRAL"
-        if pcr >= 1.4: signal = "STRONG BULLISH (Overbought)"
-        elif pcr <= 0.6: signal = "STRONG BEARISH (Oversold)"
-        elif pcr > 1.15: signal = "BULLISH BIAS"
-        elif pcr < 0.85: signal = "BEARISH BIAS"
+        # --- AI SUGGESTION BOX ---
+        suggestion, color = get_suggestion(res['atm_pcr'], st.session_state.history[selected_index])
+        st.info(f"**AI ANALYZER:** {suggestion}")
 
-        # --- ALERT TRIGGER ---
-        if signal != st.session_state.last_signal and "STRONG" in signal:
-            if enable_audio: play_sound()
-            st.toast(f"🚨 SIGNAL ALERT: {signal}", icon="🔥")
-            st.session_state.last_signal = signal
-
-        # Display Signal Box
-        sig_color = "green" if "BULLISH" in signal else "red" if "BEARISH" in signal else "blue"
-        st.markdown(f"""<div style="padding:15px; border-radius:10px; background-color:{sig_color}; color:white; text-align:center;">
-            <h2 style="margin:0;">{signal}</h2>
-            <p style="margin:0;">PCR: {pcr} | Momentum: {"Rising" if len(st.session_state.history[selected_index]) > 1 and pcr > st.session_state.history[selected_index].iloc[-2]['PCR'] else "Falling"}</p>
-        </div>""", unsafe_allow_html=True)
-
-        st.divider()
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Spot Price", f"₹{res['spot']}")
-        c2.metric("Current PCR", pcr, delta=round(pcr-1.0, 2))
-        c3.metric("Support (PE OI)", f"{res['pe_total']:,}")
-        c4.metric("Resistance (CE OI)", f"{res['ce_total']:,}")
+        c2.metric("PCR", res['atm_pcr'], delta=round(res['atm_pcr']-1.0, 2))
+        c3.metric("Put OI", f"{res['pe_total']:,}")
+        c4.metric("Call OI", f"{res['ce_total']:,}")
 
+        # Charts Section
+        st.divider()
         col_chart, col_bars = st.columns([2, 1])
         with col_chart:
-            fig = go.Figure(go.Scatter(x=st.session_state.history[selected_index]['Time'], y=st.session_state.history[selected_index]['PCR'], mode='lines+markers', line=dict(color='#00ffcc')))
-            fig.update_layout(template="plotly_dark", height=300, title="Intraday PCR Movement")
+            st.subheader("PCR Momentum History")
+            fig = go.Figure(go.Scatter(x=st.session_state.history[selected_index]['Time'], 
+                                     y=st.session_state.history[selected_index]['PCR'],
+                                     mode='lines+markers', line=dict(color='#2ecc71', width=3)))
+            fig.update_layout(template="plotly_dark", height=300)
             st.plotly_chart(fig, use_container_width=True)
             
         with col_bars:
-            st.subheader("OI Pulse")
+            st.subheader("Support vs Resistance")
             st.bar_chart(data=pd.DataFrame({'OI': [res['pe_total'], res['ce_total']]}, index=['Puts', 'Calls']))
 
-        st.subheader("ATM Option Chain Details")
+        st.subheader("Live Option Chain (ATM)")
         if HAS_MATPLOTLIB:
             st.dataframe(res['table'].style.background_gradient(subset=['Put OI Chg', 'Call OI Chg'], cmap='RdYlGn'), use_container_width=True, hide_index=True)
         else:
