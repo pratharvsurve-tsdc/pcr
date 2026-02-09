@@ -25,20 +25,6 @@ def play_sound():
     """
     st.components.v1.html(audio_html, height=0)
 
-# --- MAX PAIN CALCULATION ENGINE ---
-def calculate_max_pain(df):
-    strikes = df['Strike'].tolist()
-    total_pain_list = []
-    for s in strikes:
-        # Payout to Call Buyers if expiry is at 's'
-        call_payout = df[df['Strike'] < s].apply(lambda x: (s - x['Strike']) * x['Call OI'], axis=1).sum()
-        # Payout to Put Buyers if expiry is at 's'
-        put_payout = df[df['Strike'] > s].apply(lambda x: (x['Strike'] - s) * x['Put OI'], axis=1).sum()
-        total_pain_list.append(call_payout + put_payout)
-    
-    max_pain_strike = strikes[total_pain_list.index(min(total_pain_list))]
-    return max_pain_strike
-
 class NSEPro:
     def __init__(self):
         self.headers = {
@@ -52,7 +38,7 @@ class NSEPro:
         prices = {"NIFTY": 23500, "BANKNIFTY": 51200, "FINNIFTY": 23200, "MIDCPNIFTY": 12800}
         spot = prices.get(symbol, 20000)
         interval = 50 if symbol != "BANKNIFTY" else 100
-        strikes = [spot + (i * interval) for i in range(-8, 9)]
+        strikes = [spot + (i * interval) for i in range(-5, 6)]
         df = pd.DataFrame({
             'Strike': strikes,
             'Call OI': [random.randint(5000, 25000) for _ in strikes],
@@ -74,7 +60,7 @@ class NSEPro:
             df_raw = pd.json_normalize(data['filtered']['data'])
             df_raw['diff'] = abs(df_raw['strikePrice'] - underlying)
             atm_idx = df_raw['diff'].idxmin()
-            subset = df_raw.iloc[max(0, atm_idx-8):atm_idx+9].copy()
+            subset = df_raw.iloc[max(0, atm_idx-5):atm_idx+6].copy()
             pcr = round(subset['PE.openInterest'].sum() / subset['CE.openInterest'].sum(), 2)
             display_df = subset[['strikePrice', 'CE.openInterest', 'PE.openInterest', 'CE.changeinOpenInterest', 'PE.changeinOpenInterest']]
             display_df.columns = ['Strike', 'Call OI', 'Put OI', 'Call OI Chg', 'Put OI Chg']
@@ -112,9 +98,6 @@ while True:
         new_entry = pd.DataFrame({'Time': [curr_time], 'PCR': [pcr]})
         st.session_state.history[selected_index] = pd.concat([st.session_state.history[selected_index], new_entry], ignore_index=True).tail(50)
 
-        # Calculate Max Pain
-        max_pain_val = calculate_max_pain(res['table'])
-
         # --- SIGNAL ANALYZER ---
         signal = "NEUTRAL"
         if pcr >= 1.4: signal = "STRONG BULLISH (Overbought)"
@@ -136,12 +119,11 @@ while True:
         </div>""", unsafe_allow_html=True)
 
         st.divider()
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Spot Price", f"₹{res['spot']}")
-        c2.metric("Max Pain", f"₹{max_pain_val}", help="Strike where buyers lose most money")
-        c3.metric("Current PCR", pcr, delta=round(pcr-1.0, 2))
-        c4.metric("Support (PE OI)", f"{res['pe_total']:,}")
-        c5.metric("Resistance (CE OI)", f"{res['ce_total']:,}")
+        c2.metric("Current PCR", pcr, delta=round(pcr-1.0, 2))
+        c3.metric("Support (PE OI)", f"{res['pe_total']:,}")
+        c4.metric("Resistance (CE OI)", f"{res['ce_total']:,}")
 
         col_chart, col_bars = st.columns([2, 1])
         with col_chart:
@@ -153,22 +135,11 @@ while True:
             st.subheader("OI Pulse")
             st.bar_chart(data=pd.DataFrame({'OI': [res['pe_total'], res['ce_total']]}, index=['Puts', 'Calls']))
 
-        # --- STRIKE HEATMAP (TABLE BASED) ---
-        st.subheader("🔥 Strike Heatmap & Option Chain")
-        # Creating a style that highlights highest OI strikes (Heatmap effect without a chart)
+        st.subheader("ATM Option Chain Details")
         if HAS_MATPLOTLIB:
-            styled_df = res['table'].style.background_gradient(
-                subset=['Call OI', 'Put OI'], cmap='YlGn'
-            ).background_gradient(
-                subset=['Call OI Chg', 'Put OI Chg'], cmap='RdYlGn'
-            ).apply(
-                lambda x: ['background-color: #4B0082; color: white' if x['Strike'] == max_pain_val else '' for _ in x], axis=1
-            )
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            st.dataframe(res['table'].style.background_gradient(subset=['Put OI Chg', 'Call OI Chg'], cmap='RdYlGn'), use_container_width=True, hide_index=True)
         else:
             st.dataframe(res['table'], use_container_width=True, hide_index=True)
-        
-        st.caption("Note: Deep Purple row indicates the current Max Pain Strike.")
 
     time.sleep(refresh_speed)
     st.rerun()
